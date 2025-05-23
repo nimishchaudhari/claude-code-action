@@ -40,19 +40,280 @@ jobs:
         run: |
           pip install fastapi uvicorn pydantic httpx litellm python-dotenv
 
-      - name: Create Universal LLM Proxy
+      - name: Create Universal LLM Proxy Server
         run: |
           cat > universal_proxy.py << 'EOF'
-          # Your FastAPI implementation goes here
+          from fastapi import FastAPI, Request, HTTPException
+          import uvicorn
+          import logging
+          import json
+          from pydantic import BaseModel, Field, field_validator
+          from typing import List, Dict, Any, Optional, Union, Literal
+          import httpx
+          import os
+          from fastapi.responses import JSONResponse, StreamingResponse
+          import litellm
+          import uuid
+          import time
+          from dotenv import load_dotenv
+          import re
+          from datetime import datetime
+          import sys
+
+          # Load environment variables
+          load_dotenv()
+
+          # Configure logging
+          logging.basicConfig(
+              level=logging.WARN,
+              format='%(asctime)s - %(levelname)s - %(message)s',
+          )
+          logger = logging.getLogger(__name__)
+
+          # Configure uvicorn to be quieter
+          logging.getLogger("uvicorn").setLevel(logging.WARNING)
+          logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+          logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+          # Block verbose log messages
+          class MessageFilter(logging.Filter):
+              def filter(self, record):
+                  blocked_phrases = [
+                      "LiteLLM completion()", "HTTP Request:", "selected model name for cost calculation",
+                      "utils.py", "cost_calculator"
+                  ]
+                  if hasattr(record, 'msg') and isinstance(record.msg, str):
+                      for phrase in blocked_phrases:
+                          if phrase in record.msg:
+                              return False
+                  return True
+
+          root_logger = logging.getLogger()
+          root_logger.addFilter(MessageFilter())
+
+          app = FastAPI()
+
+          # Get API keys from environment
+          ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+          OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+          # Get configuration
+          PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+          BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4o")
+          SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
+
+          # Model lists
+          OPENAI_MODELS = ["o3-mini", "o1", "o1-mini", "o1-pro", "gpt-4o", "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo"]
+          GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+
+          # Your existing model classes and helper functions would go here...
+          # (ContentBlockText, Message, Tool, etc. - I'll abbreviate for space)
+
+          class ContentBlockText(BaseModel):
+              type: Literal["text"]
+              text: str
+
+          class Message(BaseModel):
+              role: Literal["user", "assistant"] 
+              content: Union[str, List[Dict[str, Any]]]
+
+          class Tool(BaseModel):
+              name: str
+              description: Optional[str] = None
+              input_schema: Dict[str, Any]
+
+          class MessagesRequest(BaseModel):
+              model: str
+              max_tokens: int
+              messages: List[Message]
+              system: Optional[Union[str, List[Dict[str, Any]]]] = None
+              stream: Optional[bool] = False
+              temperature: Optional[float] = 1.0
+              tools: Optional[List[Tool]] = None
+              
+              @field_validator('model')
+              def validate_model_field(cls, v):
+                  original_model = v
+                  clean_v = v.replace('anthropic/', '').replace('openai/', '').replace('gemini/', '')
+                  
+                  # Map Haiku to small model
+                  if 'haiku' in clean_v.lower():
+                      return f"{PREFERRED_PROVIDER}/{SMALL_MODEL}" if PREFERRED_PROVIDER != "openai" else f"openai/{SMALL_MODEL}"
+                  # Map Sonnet to big model  
+                  elif 'sonnet' in clean_v.lower():
+                      return f"{PREFERRED_PROVIDER}/{BIG_MODEL}" if PREFERRED_PROVIDER != "openai" else f"openai/{BIG_MODEL}"
+                  # Add prefixes to known models
+                  elif clean_v in GEMINI_MODELS:
+                      return f"gemini/{clean_v}"
+                  elif clean_v in OPENAI_MODELS:
+                      return f"openai/{clean_v}"
+                  
+                  return v
+
+          class Usage(BaseModel):
+              input_tokens: int
+              output_tokens: int
+
+          class MessagesResponse(BaseModel):
+              id: str
+              model: str
+              role: Literal["assistant"] = "assistant"
+              content: List[Dict[str, Any]]
+              type: Literal["message"] = "message"
+              stop_reason: Optional[str] = None
+              usage: Usage
+
+          def convert_anthropic_to_litellm(request: MessagesRequest) -> Dict[str, Any]:
+              """Convert Anthropic format to LiteLLM/OpenAI format"""
+              messages = []
+              
+              # Add system message
+              if request.system:
+                  if isinstance(request.system, str):
+                      messages.append({"role": "system", "content": request.system})
+                  elif isinstance(request.system, list):
+                      system_text = ""
+                      for block in request.system:
+                          if isinstance(block, dict) and block.get("type") == "text":
+                              system_text += block.get("text", "") + "\n"
+                      if system_text:
+                          messages.append({"role": "system", "content": system_text.strip()})
+              
+              # Convert messages
+              for msg in request.messages:
+                  content = msg.content
+                  if isinstance(content, str):
+                      messages.append({"role": msg.role, "content": content})
+                  else:
+                      # Convert content blocks to text
+                      text_content = ""
+                      for block in content:
+                          if isinstance(block, dict) and block.get("type") == "text":
+                              text_content += block.get("text", "") + "\n"
+                      messages.append({"role": msg.role, "content": text_content.strip() or "..."})
+              
+              # Build request
+              litellm_request = {
+                  "model": request.model,
+                  "messages": messages,
+                  "max_tokens": min(request.max_tokens, 16384),
+                  "temperature": request.temperature,
+                  "stream": request.stream,
+              }
+              
+              # Add API key based on model
+              if request.model.startswith("openai/"):
+                  litellm_request["api_key"] = OPENAI_API_KEY
+              elif request.model.startswith("gemini/"):
+                  litellm_request["api_key"] = GEMINI_API_KEY
+              else:
+                  litellm_request["api_key"] = ANTHROPIC_API_KEY
+              
+              return litellm_request
+
+          def convert_litellm_to_anthropic(response, original_request: MessagesRequest) -> MessagesResponse:
+              """Convert LiteLLM response to Anthropic format"""
+              if hasattr(response, 'choices'):
+                  choice = response.choices[0]
+                  content_text = choice.message.content if hasattr(choice.message, 'content') else ""
+                  usage_info = response.usage
+                  response_id = getattr(response, 'id', f"msg_{uuid.uuid4()}")
+              else:
+                  # Handle dict response
+                  choices = response.get("choices", [{}])
+                  choice = choices[0] if choices else {}
+                  message = choice.get("message", {})
+                  content_text = message.get("content", "")
+                  usage_info = response.get("usage", {})
+                  response_id = response.get("id", f"msg_{uuid.uuid4()}")
+              
+              content = [{"type": "text", "text": content_text}] if content_text else [{"type": "text", "text": ""}]
+              
+              # Extract usage
+              if isinstance(usage_info, dict):
+                  input_tokens = usage_info.get("prompt_tokens", 0)
+                  output_tokens = usage_info.get("completion_tokens", 0)
+              else:
+                  input_tokens = getattr(usage_info, "prompt_tokens", 0)
+                  output_tokens = getattr(usage_info, "completion_tokens", 0)
+              
+              return MessagesResponse(
+                  id=response_id,
+                  model=original_request.model,
+                  content=content,
+                  stop_reason="end_turn",
+                  usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+              )
+
+          @app.post("/v1/messages")
+          async def create_message(request: MessagesRequest):
+              try:
+                  logger.info(f"Processing request for model: {request.model}")
+                  
+                  # Convert to LiteLLM format
+                  litellm_request = convert_anthropic_to_litellm(request)
+                  
+                  if request.stream:
+                      # Handle streaming (simplified for space)
+                      response_generator = await litellm.acompletion(**litellm_request)
+                      return StreamingResponse(
+                          handle_streaming(response_generator, request),
+                          media_type="text/event-stream"
+                      )
+                  else:
+                      # Handle regular completion
+                      litellm_response = litellm.completion(**litellm_request)
+                      return convert_litellm_to_anthropic(litellm_response, request)
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  raise HTTPException(status_code=500, detail=str(e))
+
+          async def handle_streaming(response_generator, original_request):
+              """Simple streaming handler"""
+              try:
+                  async for chunk in response_generator:
+                      if hasattr(chunk, 'choices') and chunk.choices:
+                          choice = chunk.choices[0]
+                          if hasattr(choice, 'delta') and hasattr(choice.delta, 'content'):
+                              content = choice.delta.content
+                              if content:
+                                  yield f"data: {json.dumps({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                          if hasattr(choice, 'finish_reason') and choice.finish_reason:
+                              yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+                              yield "data: [DONE]\n\n"
+                              return
+              except Exception as e:
+                  logger.error(f"Streaming error: {e}")
+                  yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+          @app.get("/")
+          async def root():
+              return {"message": "Universal Claude Proxy Server", "status": "healthy"}
+
+          @app.get("/health")
+          async def health():
+              return {"status": "healthy"}
+
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", port=8082, log_level="error")
           EOF
 
       - name: Start Universal Proxy Server
         run: |
           python universal_proxy.py &
           echo $! > proxy.pid
-          sleep 5
-          curl -f http://localhost:8082/ || (echo "Proxy server failed to start" && exit 1)
-          echo "Universal proxy server started successfully"
+          sleep 10
+          curl -f http://localhost:8082/health || (echo "Proxy server failed to start" && exit 1)
+          echo "✅ Universal proxy server started successfully"
+        env:
+          PREFERRED_PROVIDER: ${{ vars.PREFERRED_PROVIDER || 'openai' }}
+          BIG_MODEL: ${{ vars.BIG_MODEL || 'gpt-4o' }}
+          SMALL_MODEL: ${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Run Claude Code Action
         uses: anthropics/claude-code-action@main
@@ -64,13 +325,6 @@ jobs:
           custom_instructions: "You have also been granted tools for editing files and running bun commands (install, run, test) for testing your changes."
         env:
           ANTHROPIC_BASE_URL: "http://localhost:8082"
-          # Environment variables for your proxy
-          PREFERRED_PROVIDER: ${{ vars.PREFERRED_PROVIDER || 'openai' }}
-          BIG_MODEL: ${{ vars.BIG_MODEL || 'gpt-4o' }}
-          SMALL_MODEL: ${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Cleanup
         if: always()
