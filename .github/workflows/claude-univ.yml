@@ -109,7 +109,7 @@ jobs:
         uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key:   #${{ secrets.ANTHROPIC_API_KEY }}
-          anthropic_base_url: http://localhost:8082 claude
+          anthropic_base_url: "http://localhost:8082 claude"
           timeout_minutes: "60"
           github_token: ${{ secrets.GITHUB_TOKEN }}
           # Additional configuration for the beta action
