@@ -19,27 +19,18 @@ jobs:
       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pull-requests: read
-      issues: read
+      contents: write  # Changed from 'read' to 'write' for full repo access
+      pull-requests: write
+      issues: write
       id-token: write
-    services:
-      claude-proxy:
-        image: python:3.11-slim
-        ports:
-          - 8082:8082
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PREFERRED_PROVIDER: ${{ vars.PREFERRED_PROVIDER || 'openai' }}
-          BIG_MODEL: ${{ vars.BIG_MODEL || 'gpt-4' }}
-          SMALL_MODEL: ${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
+      actions: read  # Added for OIDC
+      statuses: write  # Added for status updates
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0  # Changed from 1 to 0 for full history
+          token: ${{ secrets.GITHUB_TOKEN }}  # Explicitly specify token
 
       - name: Setup proxy server
         run: |
@@ -47,7 +38,7 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           export PATH="$HOME/.cargo/bin:$PATH"
           
-          # Clone and setup proxy server in background
+          # Clone and setup proxy server
           git clone https://github.com/1rgs/claude-code-openai.git proxy-server
           cd proxy-server
           
@@ -55,8 +46,8 @@ jobs:
           echo "Files in proxy-server directory:"
           ls -la
           
-          # Create .env file
-          cat > .env << EOF
+          # Create .env file with proper escaping
+          cat > .env << 'EOF'
           ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
@@ -65,59 +56,83 @@ jobs:
           SMALL_MODEL=${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
           EOF
           
-          echo "Environment file created:"
-          cat .env
+          # Don't echo sensitive environment file
+          echo "Environment file created successfully"
           
-          # Start proxy server in background
-          uv run uvicorn server:app --host 0.0.0.0 --port 8082 &
-          SERVER_PID=$!
-          
-          # Wait for server to be ready
-          echo "Waiting for proxy server to start..."
-          sleep 15
-          
-          # Check if server process is still running
-          if ! kill -0 $SERVER_PID 2>/dev/null; then
-            echo "Server process died, checking logs..."
-            wait $SERVER_PID
-            exit 1
+          # Install dependencies if requirements.txt exists
+          if [ -f requirements.txt ]; then
+            echo "Installing Python dependencies..."
+            uv pip install -r requirements.txt
           fi
           
-          # Test proxy server with retries
-          echo "Testing proxy server connectivity..."
+          # Start proxy server with better error handling
+          echo "Starting proxy server..."
+          uv run uvicorn server:app --host 0.0.0.0 --port 8082 --log-level info > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
           
-          for i in {1..5}; do
-            echo "Attempt $i/5: Testing server..."
+          # Save PID for cleanup
+          echo $SERVER_PID > /tmp/proxy_server.pid
+          
+          # Wait for server to be ready with better monitoring
+          echo "Waiting for proxy server to start..."
+          for i in {1..30}; do
             if curl -f -s http://localhost:8082/ > /dev/null 2>&1; then
-              echo "✅ Proxy server is responding!"
-              curl -s http://localhost:8082/ | head -1
+              echo "✅ Proxy server is ready after $i seconds!"
               break
+            elif ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "❌ Server process died. Last 50 lines of server log:"
+              tail -n 50 server.log
+              exit 1
             else
-              echo "Server not ready yet, waiting..."
-              if [ $i -eq 5 ]; then
-                echo "❌ Final attempt - checking what's happening..."
-                echo "Server logs:"
-                curl -v http://localhost:8082/ || true
-                echo "Process status:"
-                ps aux | grep uvicorn || echo "No uvicorn process found"
-                echo "Port status:"
-                netstat -tlnp | grep 8082 || echo "No process listening on port 8082"
+              if [ $i -eq 30 ]; then
+                echo "❌ Timeout waiting for server. Server log:"
+                cat server.log
                 exit 1
-              else
-                sleep 5
               fi
+              sleep 1
             fi
           done
+          
+          # Verify server is working
+          echo "Testing proxy server endpoints..."
+          curl -s http://localhost:8082/ || echo "Warning: Root endpoint test failed"
         
+      - name: Configure Git for Claude
+        run: |
+          # Configure git to allow Claude to make commits
+          git config --global user.name "claude[bot]"
+          git config --global user.email "claude-bot@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Run Claude PR Action
         uses: anthropics/claude-code-action@beta
         with:
-          # Route through proxy server instead of direct Anthropic API
-          anthropic_api_key: dummy-key-proxy-handles-auth
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           anthropic_base_url: http://localhost:8082
           timeout_minutes: "60"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Additional configuration for the beta action
+          auto_merge: false
+          debug: true
         env:
-          # Pass through environment variables for the action
+          # Environment variables for the action
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Additional environment variables that might be needed
+          ACTIONS_RUNNER_DEBUG: true
+          ACTIONS_STEP_DEBUG: true
+
+      - name: Cleanup proxy server
+        if: always()
+        run: |
+          # Kill proxy server if it's still running
+          if [ -f /tmp/proxy_server.pid ]; then
+            PID=$(cat /tmp/proxy_server.pid)
+            if kill -0 $PID 2>/dev/null; then
+              echo "Stopping proxy server (PID: $PID)..."
+              kill $PID
+            fi
+          fi
