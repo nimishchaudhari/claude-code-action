@@ -1,0 +1,284 @@
+name: "Universal LLM Code Action"
+description: "General-purpose LLM agent for GitHub PRs and issues. Supports any LLM provider via LiteLLM proxy."
+branding:
+  icon: "at-sign"
+  color: "orange"
+
+inputs:
+  # Core settings
+  trigger_phrase:
+    description: "The trigger phrase to look for in comments or issue body"
+    required: false
+    default: "@claude"
+  
+  # LLM Configuration - users just specify model and provide needed API keys
+  llm_model:
+    description: "Model name (e.g., gpt-4, claude-3-sonnet-20240229, gemini-pro)"
+    required: false
+    default: "claude-3-sonnet-20240229"
+  
+  # API Keys - users only provide what they need
+  # LiteLLM will automatically use the right one based on model name
+  OPENAI_API_KEY:
+    description: "OpenAI API key"
+    required: false
+  ANTHROPIC_API_KEY:
+    description: "Anthropic API key"
+    required: false
+  VERTEX_PROJECT:
+    description: "Google Cloud project ID for Vertex AI"
+    required: false
+  VERTEX_LOCATION:
+    description: "Google Cloud location for Vertex AI"
+    required: false
+    default: "us-central1"
+  AZURE_API_KEY:
+    description: "Azure OpenAI API key"
+    required: false
+  AZURE_API_BASE:
+    description: "Azure OpenAI endpoint"
+    required: false
+  GROQ_API_KEY:
+    description: "Groq API key"
+    required: false
+  TOGETHER_API_KEY:
+    description: "Together AI API key"
+    required: false
+  COHERE_API_KEY:
+    description: "Cohere API key"
+    required: false
+  HUGGINGFACE_API_KEY:
+    description: "Hugging Face API key"
+    required: false
+  
+  # Advanced options
+  enable_proxy:
+    description: "Force enable/disable LiteLLM proxy (auto-detects by default)"
+    required: false
+    default: "auto"
+  
+  # Original Claude Code Action inputs (preserved)
+  allowed_tools:
+    description: "Additional tools for Claude to use"
+    required: false
+    default: ""
+  disallowed_tools:
+    description: "Tools that Claude should never use"
+    required: false
+    default: ""
+  custom_instructions:
+    description: "Additional custom instructions"
+    required: false
+    default: ""
+  direct_prompt:
+    description: "Direct instruction (bypasses trigger detection)"
+    required: false
+    default: ""
+  github_token:
+    description: "GitHub token (optional if using GitHub App)"
+    required: false
+  timeout_minutes:
+    description: "Timeout in minutes for execution"
+    required: false
+    default: "30"
+
+outputs:
+  execution_file:
+    description: "Path to the execution output file"
+    value: ${{ steps.claude-code.outputs.execution_file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Dependencies
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.2.11
+
+    - name: Install Action Dependencies
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        bun install
+
+    - name: Detect Provider and Configure Proxy
+      id: detect-provider
+      shell: bash
+      run: |
+        MODEL="${{ inputs.llm_model }}"
+        ENABLE_PROXY="${{ inputs.enable_proxy }}"
+        
+        # Auto-detect if we need LiteLLM proxy
+        if [[ "$ENABLE_PROXY" == "auto" ]]; then
+          # Check if model is standard Anthropic format (no provider prefix)
+          if [[ "$MODEL" =~ ^claude-.*$ ]]; then
+            # Check if we're using direct Anthropic API
+            if [[ -n "${{ inputs.ANTHROPIC_API_KEY }}" && -z "${{ inputs.OPENAI_API_KEY }}" ]]; then
+              ENABLE_PROXY="false"
+              echo "🔍 Detected direct Anthropic usage, disabling proxy"
+            else
+              ENABLE_PROXY="true"
+              echo "🔍 Detected multi-provider setup, enabling proxy"
+            fi
+          else
+            ENABLE_PROXY="true"
+            echo "🔍 Detected non-Anthropic model, enabling proxy"
+          fi
+        fi
+        
+        # Normalize model name for LiteLLM
+        NORMALIZED_MODEL="$MODEL"
+        if [[ "$MODEL" =~ ^gpt- ]] && [[ ! "$MODEL" =~ ^openai/ ]]; then
+          NORMALIZED_MODEL="openai/$MODEL"
+        elif [[ "$MODEL" =~ ^claude- ]] && [[ ! "$MODEL" =~ ^anthropic/ ]]; then
+          NORMALIZED_MODEL="anthropic/$MODEL"
+        elif [[ "$MODEL" =~ ^gemini ]] && [[ ! "$MODEL" =~ ^vertex_ai/ ]]; then
+          NORMALIZED_MODEL="vertex_ai/$MODEL"
+        fi
+        
+        echo "enable_proxy=$ENABLE_PROXY" >> $GITHUB_OUTPUT
+        echo "normalized_model=$NORMALIZED_MODEL" >> $GITHUB_OUTPUT
+        echo "🚀 Model: $MODEL → $NORMALIZED_MODEL"
+        echo "🔧 Proxy: $ENABLE_PROXY"
+
+    - name: Create Minimal LiteLLM Config
+      if: steps.detect-provider.outputs.enable_proxy == 'true'
+      shell: bash
+      run: |
+        mkdir -p /tmp/litellm
+        
+        # Create minimal config - LiteLLM auto-detects most settings
+        cat > /tmp/litellm/config.yaml << 'EOF'
+        model_list:
+          - model_name: ${{ inputs.llm_model }}
+            litellm_params:
+              model: ${{ steps.detect-provider.outputs.normalized_model }}
+              # LiteLLM will auto-read {PROVIDER}_API_KEY environment variables
+
+        general_settings:
+          master_key: sk-1234  # Simple key for internal proxy use
+          
+        litellm_settings:
+          drop_params: true   # Drop unsupported parameters
+          set_verbose: false  # Reduce noise
+        EOF
+        
+        echo "📝 Generated LiteLLM config:"
+        cat /tmp/litellm/config.yaml
+
+    - name: Start LiteLLM Proxy Service
+      if: steps.detect-provider.outputs.enable_proxy == 'true'
+      shell: bash
+      run: |
+        # Install LiteLLM in background
+        pip install litellm[proxy] &
+        
+        # Wait for installation
+        INSTALL_PID=$!
+        echo "📦 Installing LiteLLM (PID: $INSTALL_PID)..."
+        wait $INSTALL_PID
+        
+        # Start proxy in background
+        echo "🚀 Starting LiteLLM proxy..."
+        litellm --config /tmp/litellm/config.yaml --port 4000 --host 0.0.0.0 > /tmp/litellm.log 2>&1 &
+        PROXY_PID=$!
+        echo $PROXY_PID > /tmp/litellm.pid
+        
+        # Wait for proxy to be ready
+        echo "⏳ Waiting for LiteLLM proxy to start..."
+        for i in {1..30}; do
+          if curl -s http://localhost:4000/health > /dev/null 2>&1; then
+            echo "✅ LiteLLM proxy is ready!"
+            break
+          fi
+          if [ $i -eq 30 ]; then
+            echo "❌ Timeout waiting for LiteLLM proxy"
+            echo "=== LiteLLM Logs ==="
+            cat /tmp/litellm.log
+            exit 1
+          fi
+          sleep 2
+        done
+      env:
+        # Pass through all provider API keys - LiteLLM will use the right ones
+        OPENAI_API_KEY: ${{ inputs.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ inputs.ANTHROPIC_API_KEY }}
+        VERTEX_PROJECT: ${{ inputs.VERTEX_PROJECT }}
+        VERTEX_LOCATION: ${{ inputs.VERTEX_LOCATION }}
+        AZURE_API_KEY: ${{ inputs.AZURE_API_KEY }}
+        AZURE_API_BASE: ${{ inputs.AZURE_API_BASE }}
+        GROQ_API_KEY: ${{ inputs.GROQ_API_KEY }}
+        TOGETHER_API_KEY: ${{ inputs.TOGETHER_API_KEY }}
+        COHERE_API_KEY: ${{ inputs.COHERE_API_KEY }}
+        HUGGINGFACE_API_KEY: ${{ inputs.HUGGINGFACE_API_KEY }}
+
+    - name: Prepare Claude Code Action
+      id: prepare
+      shell: bash
+      run: |
+        bun run ${{ github.action_path }}/src/entrypoints/prepare.ts
+      env:
+        TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+        ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+        CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
+        DIRECT_PROMPT: ${{ inputs.direct_prompt }}
+        OVERRIDE_GITHUB_TOKEN: ${{ inputs.github_token }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+
+    - name: Run Claude Code with Universal LLM Support
+      id: claude-code
+      if: steps.prepare.outputs.contains_trigger == 'true'
+      uses: anthropics/claude-code-base-action@beta
+      with:
+        prompt_file: /tmp/claude-prompts/claude-prompt.txt
+        allowed_tools: ${{ inputs.allowed_tools }}
+        disallowed_tools: ${{ inputs.disallowed_tools }}
+        timeout_minutes: ${{ inputs.timeout_minutes }}
+        model: ${{ inputs.llm_model }}
+        anthropic_api_key: ${{ steps.detect-provider.outputs.enable_proxy == 'true' && 'proxy-key' || inputs.ANTHROPIC_API_KEY }}
+      env:
+        # Route through proxy if enabled, otherwise use direct API
+        ANTHROPIC_BASE_URL: ${{ steps.detect-provider.outputs.enable_proxy == 'true' && 'http://localhost:4000/anthropic' || '' }}
+        
+        # Pass through GitHub token
+        GITHUB_TOKEN: ${{ steps.prepare.outputs.GITHUB_TOKEN }}
+        
+        # Pass through provider keys for direct usage when proxy is disabled
+        ANTHROPIC_API_KEY: ${{ inputs.ANTHROPIC_API_KEY }}
+
+    - name: Cleanup
+      if: always() && steps.detect-provider.outputs.enable_proxy == 'true'
+      shell: bash
+      run: |
+        if [ -f /tmp/litellm.pid ]; then
+          PROXY_PID=$(cat /tmp/litellm.pid)
+          echo "🧹 Stopping LiteLLM proxy (PID: $PROXY_PID)"
+          kill $PROXY_PID 2>/dev/null || true
+        fi
+
+    # ... rest of existing steps for comment updates, etc.
+    - name: Update comment with job link
+      if: steps.prepare.outputs.contains_trigger == 'true' && steps.prepare.outputs.claude_comment_id && always()
+      shell: bash
+      run: |
+        bun run ${{ github.action_path }}/src/entrypoints/update-comment-link.ts
+      env:
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        CLAUDE_COMMENT_ID: ${{ steps.prepare.outputs.claude_comment_id }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_TOKEN: ${{ steps.prepare.outputs.GITHUB_TOKEN }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
+        OUTPUT_FILE: ${{ steps.claude-code.outputs.execution_file || '' }}
+
+    - name: Display Execution Report
+      if: steps.prepare.outputs.contains_trigger == 'true' && steps.claude-code.outputs.execution_file != ''
+      shell: bash
+      run: |
+        echo "## Universal LLM Code Action Report" >> $GITHUB_STEP_SUMMARY
+        echo "**Model:** ${{ inputs.llm_model }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Proxy Enabled:** ${{ steps.detect-provider.outputs.enable_proxy }}" >> $GITHUB_STEP_SUMMARY
+        echo '```json' >> $GITHUB_STEP_SUMMARY
+        cat "${{ steps.claude-code.outputs.execution_file }}" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
