@@ -24,7 +24,6 @@ jobs:
       issues: write
       id-token: write
       actions: read           # Added for accessing workflow information
-      metadata: read          # Added for repository metadata
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
