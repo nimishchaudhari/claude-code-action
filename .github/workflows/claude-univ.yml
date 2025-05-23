@@ -29,22 +29,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Debug Environment
-        run: |
-          echo "Checking if secrets are available..."
-          if [ -z "${{ secrets.LLM_API_KEY }}" ]; then
-            echo "ERROR: LLM_API_KEY secret is not set!"
-            exit 1
-          else
-            echo "LLM_API_KEY secret is available (length: ${#LLM_API_KEY})"
-          fi
-          echo "LLM_MODEL: ${{ vars.LLM_MODEL || 'default: claude-3-5-sonnet-20241022' }}"
-        env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       - name: Install Python and LiteLLM
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install LiteLLM
         run: |
           pip install litellm[proxy]
@@ -60,6 +49,8 @@ jobs:
           
           general_settings:
             master_key: temp_key_123
+            # Disable auth for health endpoint
+            disable_auth_on_health_endpoint: true
           EOF
 
       - name: Start LiteLLM Proxy Server
@@ -67,9 +58,10 @@ jobs:
           litellm --config litellm_config.yaml --port 4000 --host 0.0.0.0 &
           echo $! > litellm.pid
           # Wait for server to start
-          sleep 10
-          # Test if server is running
+          sleep 15
+          # Test if server is running (health endpoint should now work without auth)
           curl -f http://localhost:4000/health || (echo "LiteLLM server failed to start" && exit 1)
+          echo "LiteLLM proxy server started successfully"
 
       - name: Run Claude PR Agent
         uses: anthropics/claude-code-action@main
