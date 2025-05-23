@@ -51,6 +51,10 @@ jobs:
           git clone https://github.com/1rgs/claude-code-openai.git proxy-server
           cd proxy-server
           
+          # Check what files are available
+          echo "Files in proxy-server directory:"
+          ls -la
+          
           # Create .env file
           cat > .env << EOF
           ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
@@ -61,14 +65,49 @@ jobs:
           SMALL_MODEL=${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
           EOF
           
+          echo "Environment file created:"
+          cat .env
+          
           # Start proxy server in background
           uv run uvicorn server:app --host 0.0.0.0 --port 8082 &
+          SERVER_PID=$!
           
           # Wait for server to be ready
-          sleep 10
+          echo "Waiting for proxy server to start..."
+          sleep 15
           
-          # Test proxy server
-          curl -f http://localhost:8082/health || (echo "Proxy server failed to start" && exit 1)
+          # Check if server process is still running
+          if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "Server process died, checking logs..."
+            wait $SERVER_PID
+            exit 1
+          fi
+          
+          # Test proxy server with retries
+          echo "Testing proxy server connectivity..."
+          
+          for i in {1..5}; do
+            echo "Attempt $i/5: Testing server..."
+            if curl -f -s http://localhost:8082/ > /dev/null 2>&1; then
+              echo "✅ Proxy server is responding!"
+              curl -s http://localhost:8082/ | head -1
+              break
+            else
+              echo "Server not ready yet, waiting..."
+              if [ $i -eq 5 ]; then
+                echo "❌ Final attempt - checking what's happening..."
+                echo "Server logs:"
+                curl -v http://localhost:8082/ || true
+                echo "Process status:"
+                ps aux | grep uvicorn || echo "No uvicorn process found"
+                echo "Port status:"
+                netstat -tlnp | grep 8082 || echo "No process listening on port 8082"
+                exit 1
+              else
+                sleep 5
+              fi
+            fi
+          done
         
       - name: Run Claude PR Action
         uses: anthropics/claude-code-action@beta
