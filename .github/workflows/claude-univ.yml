@@ -1,4 +1,4 @@
-name: Universal Claude Code Action (Fixed)
+name: Claude PR Assistant (Multi-LLM)
 
 on:
   issue_comment:
@@ -11,7 +11,7 @@ on:
     types: [submitted]
 
 jobs:
-  universal-claude:
+  claude-code-action:
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -19,518 +19,66 @@ jobs:
       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
+      contents: read
+      pull-requests: read
+      issues: read
       id-token: write
-      actions: read
+    services:
+      claude-proxy:
+        image: python:3.11-slim
+        ports:
+          - 8082:8082
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PREFERRED_PROVIDER: ${{ vars.PREFERRED_PROVIDER || 'openai' }}
+          BIG_MODEL: ${{ vars.BIG_MODEL || 'gpt-4' }}
+          SMALL_MODEL: ${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Setup proxy server
         run: |
-          pip install fastapi uvicorn pydantic httpx litellm python-dotenv
-
-      - name: Create Fixed Universal LLM Proxy
-        run: |
-          cat > universal_proxy_fixed.py << 'EOF'
-          import os
-          import json
-          import uuid
-          import time
-          import logging
-          import asyncio
-          from typing import Dict, Any, List, Optional, Union, Literal
-          from fastapi import FastAPI, Request, HTTPException
-          from fastapi.responses import StreamingResponse, JSONResponse
-          from pydantic import BaseModel, field_validator
-          import litellm
-          import uvicorn
-
-          # Configure logging
-          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-          logger = logging.getLogger(__name__)
-
-          app = FastAPI()
-
-          # Configuration
-          PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
-          BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4o")
-          SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
+          # Install uv
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.cargo/bin:$PATH"
           
-          # API Keys
-          OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-          GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-          ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-
-          # Global variable to store original model
-          original_model_mapping = {}
-
-          class ContentBlock(BaseModel):
-              type: str
-              text: Optional[str] = None
-              id: Optional[str] = None
-              name: Optional[str] = None
-              input: Optional[Dict[str, Any]] = None
-              tool_use_id: Optional[str] = None
-              content: Optional[Union[str, List[Dict[str, Any]]]] = None
-
-          class Message(BaseModel):
-              role: Literal["user", "assistant", "system"]
-              content: Union[str, List[ContentBlock]]
-
-          class Tool(BaseModel):
-              name: str
-              description: Optional[str] = None
-              input_schema: Dict[str, Any]
-
-          class ToolChoice(BaseModel):
-              type: Literal["auto", "any", "tool"]
-              name: Optional[str] = None
-
-          class MessagesRequest(BaseModel):
-              model: str
-              max_tokens: int = 4096
-              messages: List[Message]
-              system: Optional[Union[str, List[Dict[str, Any]]]] = None
-              stream: Optional[bool] = False
-              temperature: Optional[float] = 1.0
-              tools: Optional[List[Tool]] = None
-              tool_choice: Optional[Union[ToolChoice, Dict[str, Any]]] = None
-              
-              @field_validator('model')
-              def map_model(cls, v):
-                  request_id = str(uuid.uuid4())
-                  original = v
-                  
-                  # Store original model for this request
-                  original_model_mapping[request_id] = original
-                  
-                  clean_v = v.replace('anthropic/', '').replace('openai/', '').replace('gemini/', '')
-                  
-                  # Map Claude models to preferred provider
-                  if 'haiku' in clean_v.lower():
-                      mapped = f"openai/{SMALL_MODEL}" if PREFERRED_PROVIDER == "openai" else f"gemini/{SMALL_MODEL}"
-                  elif 'sonnet' in clean_v.lower():
-                      mapped = f"openai/{BIG_MODEL}" if PREFERRED_PROVIDER == "openai" else f"gemini/{BIG_MODEL}"
-                  elif 'opus' in clean_v.lower():
-                      mapped = f"openai/{BIG_MODEL}" if PREFERRED_PROVIDER == "openai" else f"gemini/{BIG_MODEL}"
-                  else:
-                      # If already a known model, add appropriate prefix
-                      if clean_v in ["gpt-4o", "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo"]:
-                          mapped = f"openai/{clean_v}"
-                      elif clean_v in ["gemini-2.0-flash", "gemini-1.5-pro"]:
-                          mapped = f"gemini/{clean_v}"
-                      else:
-                          mapped = v
-                  
-                  logger.info(f"Model mapping: {original} -> {mapped}")
-                  return f"{mapped}#{request_id}"  # Embed request ID
-
-          def extract_request_id_and_model(model_string):
-              """Extract request ID and clean model from the encoded model string"""
-              if '#' in model_string:
-                  model, request_id = model_string.rsplit('#', 1)
-                  return model, request_id
-              return model_string, None
-
-          def convert_anthropic_to_litellm(request: MessagesRequest) -> Dict[str, Any]:
-              """Convert Anthropic request to LiteLLM format with better tool support"""
-              messages = []
-              
-              # Handle system message
-              if request.system:
-                  if isinstance(request.system, str):
-                      messages.append({"role": "system", "content": request.system})
-                  elif isinstance(request.system, list):
-                      system_text = ""
-                      for item in request.system:
-                          if isinstance(item, dict) and item.get("type") == "text":
-                              system_text += item.get("text", "") + "\n"
-                      if system_text:
-                          messages.append({"role": "system", "content": system_text.strip()})
-              
-              # Convert messages with better tool handling
-              for msg in request.messages:
-                  content = msg.content
-                  if isinstance(content, str):
-                      messages.append({"role": msg.role, "content": content})
-                  else:
-                      # Handle complex content blocks
-                      if msg.role == "user":
-                          # For user messages, combine all text and tool results
-                          text_parts = []
-                          for block in content:
-                              if isinstance(block, dict):
-                                  if block.get("type") == "text":
-                                      text_parts.append(block.get("text", ""))
-                                  elif block.get("type") == "tool_result":
-                                      tool_id = block.get("tool_use_id", "unknown")
-                                      result_content = block.get("content", "")
-                                      if isinstance(result_content, list):
-                                          result_text = ""
-                                          for item in result_content:
-                                              if isinstance(item, dict) and item.get("type") == "text":
-                                                  result_text += item.get("text", "") + "\n"
-                                      else:
-                                          result_text = str(result_content)
-                                      text_parts.append(f"Tool {tool_id} result: {result_text}")
-                              elif hasattr(block, 'type'):
-                                  if block.type == "text":
-                                      text_parts.append(block.text or "")
-                                  elif block.type == "tool_result":
-                                      tool_id = getattr(block, 'tool_use_id', 'unknown')
-                                      result_content = getattr(block, 'content', '')
-                                      text_parts.append(f"Tool {tool_id} result: {result_content}")
-                          
-                          messages.append({"role": msg.role, "content": "\n".join(text_parts) or "..."})
-                      else:
-                          # For assistant messages, handle tool calls
-                          text_content = ""
-                          tool_calls = []
-                          
-                          for block in content:
-                              if isinstance(block, dict):
-                                  if block.get("type") == "text":
-                                      text_content += block.get("text", "")
-                                  elif block.get("type") == "tool_use":
-                                      tool_calls.append({
-                                          "id": block.get("id", f"call_{uuid.uuid4()}"),
-                                          "type": "function",
-                                          "function": {
-                                              "name": block.get("name", ""),
-                                              "arguments": json.dumps(block.get("input", {}))
-                                          }
-                                      })
-                              elif hasattr(block, 'type'):
-                                  if block.type == "text":
-                                      text_content += block.text or ""
-                                  elif block.type == "tool_use":
-                                      tool_calls.append({
-                                          "id": getattr(block, 'id', f"call_{uuid.uuid4()}"),
-                                          "type": "function", 
-                                          "function": {
-                                              "name": getattr(block, 'name', ''),
-                                              "arguments": json.dumps(getattr(block, 'input', {}))
-                                          }
-                                      })
-                          
-                          msg_data = {"role": msg.role, "content": text_content or None}
-                          if tool_calls:
-                              msg_data["tool_calls"] = tool_calls
-                          messages.append(msg_data)
-              
-              # Extract model and request ID
-              clean_model, request_id = extract_request_id_and_model(request.model)
-              
-              # Build LiteLLM request
-              litellm_request = {
-                  "model": clean_model,
-                  "messages": messages,
-                  "max_tokens": min(request.max_tokens, 16384),
-                  "temperature": request.temperature,
-                  "stream": request.stream,
-              }
-              
-              # Add tools if present
-              if request.tools:
-                  openai_tools = []
-                  for tool in request.tools:
-                      if isinstance(tool, dict):
-                          tool_dict = tool
-                      else:
-                          tool_dict = tool.dict() if hasattr(tool, 'dict') else tool.__dict__
-                      
-                      openai_tool = {
-                          "type": "function",
-                          "function": {
-                              "name": tool_dict["name"],
-                              "description": tool_dict.get("description", ""),
-                              "parameters": tool_dict.get("input_schema", {})
-                          }
-                      }
-                      openai_tools.append(openai_tool)
-                  
-                  litellm_request["tools"] = openai_tools
-              
-              # Handle tool_choice
-              if request.tool_choice:
-                  if isinstance(request.tool_choice, dict):
-                      choice_type = request.tool_choice.get("type", "auto")
-                      if choice_type == "auto":
-                          litellm_request["tool_choice"] = "auto"
-                      elif choice_type == "any":
-                          litellm_request["tool_choice"] = "required"
-                      elif choice_type == "tool":
-                          litellm_request["tool_choice"] = {
-                              "type": "function",
-                              "function": {"name": request.tool_choice.get("name", "")}
-                          }
-              
-              # Add API key based on model
-              if clean_model.startswith("openai/"):
-                  litellm_request["api_key"] = OPENAI_API_KEY
-              elif clean_model.startswith("gemini/"):
-                  litellm_request["api_key"] = GEMINI_API_KEY
-              else:
-                  litellm_request["api_key"] = ANTHROPIC_API_KEY
-              
-              return litellm_request, request_id
-
-          def convert_litellm_to_anthropic(response, request_id: str) -> Dict[str, Any]:
-              """Convert LiteLLM response to Anthropic format with proper tool support"""
-              try:
-                  # Get original model name
-                  original_model = original_model_mapping.get(request_id, "claude-3-5-sonnet-20241022")
-                  
-                  if hasattr(response, 'choices'):
-                      choice = response.choices[0]
-                      message = choice.message
-                      content_text = getattr(message, 'content', '') or ''
-                      tool_calls = getattr(message, 'tool_calls', None)
-                      finish_reason = getattr(choice, 'finish_reason', 'stop')
-                      usage_info = response.usage
-                      response_id = getattr(response, 'id', f"msg_{uuid.uuid4()}")
-                  else:
-                      choices = response.get("choices", [{}])
-                      choice = choices[0] if choices else {}
-                      message = choice.get("message", {})
-                      content_text = message.get("content", "") or ""
-                      tool_calls = message.get("tool_calls", None)
-                      finish_reason = choice.get("finish_reason", "stop")
-                      usage_info = response.get("usage", {})
-                      response_id = response.get("id", f"msg_{uuid.uuid4()}")
-                  
-                  # Build content blocks
-                  content_blocks = []
-                  
-                  # Add text content if present
-                  if content_text:
-                      content_blocks.append({
-                          "type": "text",
-                          "text": content_text
-                      })
-                  
-                  # Add tool use blocks if present
-                  if tool_calls:
-                      for tool_call in tool_calls:
-                          if isinstance(tool_call, dict):
-                              function = tool_call.get("function", {})
-                              tool_id = tool_call.get("id", f"toolu_{uuid.uuid4()}")
-                              name = function.get("name", "")
-                              arguments = function.get("arguments", "{}")
-                          else:
-                              function = getattr(tool_call, "function", None)
-                              tool_id = getattr(tool_call, "id", f"toolu_{uuid.uuid4()}")
-                              name = getattr(function, "name", "") if function else ""
-                              arguments = getattr(function, "arguments", "{}") if function else "{}"
-                          
-                          # Parse arguments
-                          try:
-                              if isinstance(arguments, str):
-                                  tool_input = json.loads(arguments)
-                              else:
-                                  tool_input = arguments
-                          except json.JSONDecodeError:
-                              tool_input = {"raw_arguments": arguments}
-                          
-                          content_blocks.append({
-                              "type": "tool_use",
-                              "id": tool_id,
-                              "name": name,
-                              "input": tool_input
-                          })
-                  
-                  # If no content, add empty text block
-                  if not content_blocks:
-                      content_blocks.append({"type": "text", "text": ""})
-                  
-                  # Map finish_reason to stop_reason
-                  if finish_reason == "tool_calls":
-                      stop_reason = "tool_use"
-                  elif finish_reason == "length":
-                      stop_reason = "max_tokens"
-                  elif finish_reason == "stop":
-                      stop_reason = "end_turn"
-                  else:
-                      stop_reason = "end_turn"
-                  
-                  # Get usage information
-                  if isinstance(usage_info, dict):
-                      input_tokens = usage_info.get("prompt_tokens", 0)
-                      output_tokens = usage_info.get("completion_tokens", 0)
-                  else:
-                      input_tokens = getattr(usage_info, "prompt_tokens", 0)
-                      output_tokens = getattr(usage_info, "completion_tokens", 0)
-                  
-                  # Clean up request mapping
-                  if request_id in original_model_mapping:
-                      del original_model_mapping[request_id]
-                  
-                  return {
-                      "id": response_id,
-                      "type": "message", 
-                      "role": "assistant",
-                      "model": original_model,
-                      "content": content_blocks,
-                      "stop_reason": stop_reason,
-                      "stop_sequence": None,
-                      "usage": {
-                          "input_tokens": input_tokens,
-                          "cache_creation_input_tokens": 0,
-                          "cache_read_input_tokens": 0,
-                          "output_tokens": output_tokens
-                      }
-                  }
-              
-              except Exception as e:
-                  logger.error(f"Error converting response: {e}")
-                  # Return error response in Anthropic format
-                  return {
-                      "id": f"msg_{uuid.uuid4()}",
-                      "type": "message",
-                      "role": "assistant", 
-                      "model": "claude-3-5-sonnet-20241022",
-                      "content": [{"type": "text", "text": f"Error processing request: {str(e)}"}],
-                      "stop_reason": "end_turn",
-                      "stop_sequence": None,
-                      "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0}
-                  }
-
-          @app.post("/v1/messages")
-          async def messages_endpoint(request: MessagesRequest):
-              try:
-                  logger.info(f"Received request for model: {request.model}")
-                  
-                  # Convert to LiteLLM format
-                  litellm_request, request_id = convert_anthropic_to_litellm(request)
-                  
-                  logger.info(f"Converted request: {litellm_request['model']}")
-                  
-                  if request.stream:
-                      # Handle streaming (simplified for now)
-                      response_generator = await litellm.acompletion(**litellm_request)
-                      return StreamingResponse(
-                          stream_anthropic_format(response_generator, request_id),
-                          media_type="text/event-stream"
-                      )
-                  else:
-                      # Handle regular completion
-                      response = litellm.completion(**litellm_request)
-                      anthropic_response = convert_litellm_to_anthropic(response, request_id)
-                      return JSONResponse(content=anthropic_response)
-                      
-              except Exception as e:
-                  logger.error(f"Error in messages_endpoint: {e}")
-                  import traceback
-                  traceback.print_exc()
-                  
-                  # Return Anthropic-style error
-                  error_response = {
-                      "id": f"msg_{uuid.uuid4()}",
-                      "type": "message",
-                      "role": "assistant",
-                      "model": "claude-3-5-sonnet-20241022", 
-                      "content": [{"type": "text", "text": f"API Error: {str(e)}"}],
-                      "stop_reason": "end_turn",
-                      "stop_sequence": None,
-                      "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0}
-                  }
-                  return JSONResponse(content=error_response, status_code=500)
-
-          async def stream_anthropic_format(generator, request_id: str):
-              """Convert streaming response to Anthropic format"""
-              try:
-                  original_model = original_model_mapping.get(request_id, "claude-3-5-sonnet-20241022")
-                  
-                  # Send message start
-                  yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': f'msg_{uuid.uuid4()}', 'type': 'message', 'role': 'assistant', 'model': original_model, 'content': [], 'stop_reason': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
-                  
-                  # Start content block
-                  yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                  
-                  async for chunk in generator:
-                      if hasattr(chunk, 'choices') and chunk.choices:
-                          choice = chunk.choices[0]
-                          if hasattr(choice, 'delta') and hasattr(choice.delta, 'content') and choice.delta.content:
-                              yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': choice.delta.content}})}\n\n"
-                          
-                          if hasattr(choice, 'finish_reason') and choice.finish_reason:
-                              yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                              yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 0}})}\n\n"
-                              yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-                              return
-                              
-                  # Cleanup
-                  if request_id in original_model_mapping:
-                      del original_model_mapping[request_id]
-                      
-              except Exception as e:
-                  logger.error(f"Streaming error: {e}")
-                  yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-
-          @app.get("/")
-          @app.get("/health")
-          async def health():
-              return {"status": "healthy", "message": "Universal Claude Proxy - Fixed Version"}
-
-          if __name__ == "__main__":
-              uvicorn.run(app, host="0.0.0.0", port=8082, log_level="info")
+          # Clone and setup proxy server in background
+          git clone https://github.com/1rgs/claude-code-openai.git proxy-server
+          cd proxy-server
+          
+          # Create .env file
+          cat > .env << EOF
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          PREFERRED_PROVIDER=${{ vars.PREFERRED_PROVIDER || 'openai' }}
+          BIG_MODEL=${{ vars.BIG_MODEL || 'gpt-4' }}
+          SMALL_MODEL=${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
           EOF
-
-      - name: Start Fixed Universal Proxy Server
-        run: |
-          python universal_proxy_fixed.py &
-          echo $! > proxy.pid
-          sleep 15
           
-          # Test the proxy health
-          curl -f http://localhost:8082/health || (echo "❌ Proxy failed to start" && exit 1)
-          echo "✅ Universal Claude proxy started successfully"
+          # Start proxy server in background
+          uv run uvicorn server:app --host 0.0.0.0 --port 8082 &
           
-          # Test with a more comprehensive Claude request
-          echo "Testing proxy with Claude request..."
-          curl -X POST http://localhost:8082/v1/messages \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "claude-3-5-sonnet-20241022",
-              "max_tokens": 50,
-              "messages": [{"role": "user", "content": "Say hello"}],
-              "tools": [{"name": "test_tool", "description": "A test tool", "input_schema": {"type": "object", "properties": {}}}]
-            }' | jq . || echo "⚠️ Warning: Proxy test failed, but continuing..."
+          # Wait for server to be ready
+          sleep 10
+          
+          # Test proxy server
+          curl -f http://localhost:8082/health || (echo "Proxy server failed to start" && exit 1)
+        
+      - name: Run Claude PR Action
+        uses: anthropics/claude-code-action@beta
+        with:
+          # Route through proxy server instead of direct Anthropic API
+          anthropic_api_key: dummy-key-proxy-handles-auth
+          anthropic_base_url: http://localhost:8082
+          timeout_minutes: "60"
         env:
-          PREFERRED_PROVIDER: ${{ vars.PREFERRED_PROVIDER || 'openai' }}
-          BIG_MODEL: ${{ vars.BIG_MODEL || 'gpt-4o' }}
-          SMALL_MODEL: ${{ vars.SMALL_MODEL || 'gpt-4o-mini' }}
+          # Pass through environment variables for the action
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      - name: Run Claude Code Action
-        uses: anthropics/claude-code-action@main
-        with:
-          timeout_minutes: "60"
-          anthropic_api_key: "dummy_key"
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: "claude-3-5-sonnet-20241022"
-          allowed_tools: "Bash(bun install),Bash(bun test:*),Bash(bun run format),Bash(bun typecheck)"
-          custom_instructions: "You have also been granted tools for editing files and running bun commands (install, run, test) for testing your changes."
-        env:
-          ANTHROPIC_BASE_URL: "http://localhost:8082"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          if [ -f proxy.pid ]; then
-            kill $(cat proxy.pid) || true
-            rm proxy.pid
-          fi
