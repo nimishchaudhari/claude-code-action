@@ -29,11 +29,22 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Debug Environment
+        run: |
+          echo "Checking if secrets are available..."
+          if [ -z "${{ secrets.LLM_API_KEY }}" ]; then
+            echo "ERROR: LLM_API_KEY secret is not set!"
+            exit 1
+          else
+            echo "LLM_API_KEY secret is available (length: ${#LLM_API_KEY})"
+          fi
+          echo "LLM_MODEL: ${{ vars.LLM_MODEL || 'default: claude-3-5-sonnet-20241022' }}"
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       - name: Install Python and LiteLLM
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install LiteLLM
         run: |
           pip install litellm[proxy]
