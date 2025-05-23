@@ -19,15 +19,18 @@ jobs:
       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write          # Changed from 'read' to 'write' to allow branch creation
       pull-requests: write
       issues: write
       id-token: write
+      actions: read           # Added for accessing workflow information
+      metadata: read          # Added for repository metadata
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0        # Changed from 1 to 0 to get full history for branch operations
+          token: ${{ secrets.GITHUB_TOKEN }}  # Explicitly use the token
 
       - name: Install Python and LiteLLM
         uses: actions/setup-python@v5
